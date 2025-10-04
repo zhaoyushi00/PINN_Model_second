@@ -121,6 +121,7 @@ class SnapshotSequenceDataset(Dataset):
 
         # 预读取全部快照的 POD 系数 + 传感器序列
         self.data_by_rpm: Dict[int, Dict[str, np.ndarray]] = {}
+        self.initial_coeff: Dict[int, torch.Tensor] = {}
         self._preload_all()
         self.windows = self._build_windows()
 
@@ -203,12 +204,16 @@ class SnapshotSequenceDataset(Dataset):
                 times = times[:min_len]
                 sensor_seq = sensor_seq[:min_len]
 
-            self.data_by_rpm[int(rpm)] = {
+            rpm_int = int(rpm)
+            self.data_by_rpm[rpm_int] = {
                 "coeff": coeff_arr,
                 "cond": cond_arr,
                 "times": times,
                 "sensors": sensor_seq,  # 可能为 None
             }
+
+            if coeff_arr.shape[0] > 0:
+                self.initial_coeff[rpm_int] = torch.from_numpy(coeff_arr[0]).clone()
 
     def _build_windows(self):
         windows = []
@@ -241,6 +246,7 @@ class SnapshotSequenceDataset(Dataset):
             "cond": torch.from_numpy(cond),
             "time_index": torch.tensor(time_index, dtype=torch.long),
             "time_seconds": torch.tensor(time_seconds, dtype=torch.float32),
+            "rpm": torch.tensor(rpm, dtype=torch.long),
         }
         if payload["sensors"] is not None:
             sensors = payload["sensors"][end:target_end]  # [H, S]
@@ -296,6 +302,7 @@ class PrecomputedCoeffDataset(Dataset):
 
         # 将 coeffs 切分到每个 rpm 序列（按 meta 顺序）
         self.data_by_rpm: Dict[int, Dict[str, np.ndarray]] = {}
+        self.initial_coeff: Dict[int, torch.Tensor] = {}
         self._split_by_rpm()
         self.windows = self._build_windows()
 
@@ -381,12 +388,15 @@ class PrecomputedCoeffDataset(Dataset):
                 # 无实测则保持 None
                 pass
 
-            self.data_by_rpm[int(rpm)] = {
+            rpm_int = int(rpm)
+            self.data_by_rpm[rpm_int] = {
                 "coeff": coeff,
                 "cond": cond,
                 "times": times,
                 "sensors": sensors,  # [T,S] or None
             }
+            if coeff.shape[0] > 0:
+                self.initial_coeff[rpm_int] = torch.from_numpy(coeff[0]).clone()
             idx_start += length
 
     def _build_windows(self):
@@ -422,6 +432,7 @@ class PrecomputedCoeffDataset(Dataset):
             "time_seconds": torch.tensor(time_seconds, dtype=torch.float32),
             "start_time_index": torch.tensor(start, dtype=torch.long),
             "is_t0": torch.tensor(1 if start == 0 else 0, dtype=torch.long),
+            "rpm": torch.tensor(rpm, dtype=torch.long),
         }
         if payload["sensors"] is not None:
             sensor_h = payload["sensors"][end:target_end]

@@ -270,6 +270,7 @@ def train(cfg: TrainConfig):
     Phi = torch.from_numpy(dataset.Phi).to(device)
     Tbar = torch.from_numpy(dataset.Tbar).to(device)
     coords = torch.from_numpy(dataset.coords).to(device) if getattr(dataset, 'coords', None) is not None else None
+    initial_coeff_map: Dict[int, torch.Tensor] = getattr(dataset, "initial_coeff", {})
 
     # 准备日志文件
     os.makedirs(cfg.save_dir, exist_ok=True)
@@ -299,21 +300,23 @@ def train(cfg: TrainConfig):
                 vel_loss = criterion(da_pred, da_true)
                 loss = loss + cfg.vel_loss_weight * vel_loss
 
-            # 初始化 a0 监督
-            if "is_t0" in batch:
-                is_t0 = batch["is_t0"].to(device).view(-1).float()  # [B]
-                if is_t0.sum() > 0:
-                    a0_target_all = seq_a[:, 0, :]
-                    a0_pred_all = a0_net(cond)
-                    # 逐样本加权
-                    per_sample = torch.mean((a0_pred_all - a0_target_all)**2, dim=1)  # [B]
-                    a0_loss = (per_sample * is_t0).sum() / (is_t0.sum() + 1e-8)
-                    loss = loss + cfg.a0_weight * a0_loss
+            # 初始化 a0 监督：基于 RPM 的真实 t=0 系数
+            if initial_coeff_map and "rpm" in batch:
+                rpm_tensor = batch["rpm"]
+                if isinstance(rpm_tensor, torch.Tensor):
+                    rpm_list = [int(x) for x in rpm_tensor.view(-1).tolist()]
+                else:
+                    rpm_list = [int(x) for x in rpm_tensor]
+
+                if all(r in initial_coeff_map for r in rpm_list):
+                    a0_target = torch.stack([initial_coeff_map[int(r)] for r in rpm_list], dim=0).to(device)
+                else:
+                    a0_target = seq_a[:, 0, :]
             else:
-                # 兼容老数据集：退化为对所有样本监督
                 a0_target = seq_a[:, 0, :]
-                a0_pred = a0_net(cond)
-                loss = loss + cfg.a0_weight * criterion(a0_pred, a0_target)
+
+            a0_pred = a0_net(cond)
+            loss = loss + cfg.a0_weight * criterion(a0_pred, a0_target)
 
             # 传感器监督：扩展到 horizon 每一步
             if "sensor_target" in batch and coords is not None:
