@@ -45,6 +45,7 @@ def compute_physics_residual(
     dist2 = torch.cdist(pts, pts, p=2) ** 2  # [n,n]
     k = min(knn, max(1, pts.size(0) - 1))
     nn_idx = torch.topk(dist2, k=k + 1, largest=False).indices[:, 1:]  # [n,k]
+    dist_sq = dist2.gather(1, nn_idx).clamp_min(1e-12)  # [n,k]，防止零距离
 
     temps = coeff_seq @ Phi.t() + Tbar  # [L+1, N]
     T_sub_seq = temps[:, idx_sample]    # [L+1, n]
@@ -55,7 +56,8 @@ def compute_physics_residual(
     for t in range(T_sub_seq.size(0)):
         T_t = T_sub_seq[t]                    # [n]
         T_nn = T_t[nn_idx]                    # [n,k]
-        lap = (T_nn - T_t.unsqueeze(1)).mean(dim=1)  # [n]
+        # 离散拉普拉斯按距离平方缩放，保持 1/m² 量纲，并对极小距离加以保护
+        lap = ((T_nn - T_t.unsqueeze(1)) / (dist_sq + 1e-12)).mean(dim=1)  # [n]
         lap_list.append(lap)
     lap_seq = torch.stack(lap_list)           # [L+1, n]
 
