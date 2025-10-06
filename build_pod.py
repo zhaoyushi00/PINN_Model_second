@@ -266,71 +266,139 @@ def build_pod_from_folder(
 
     print(f"将使用 {len(files)} 个快照（stride={frame_stride}, max_per_rpm={max_files_per_rpm}）进行 POD …")
 
-    # 读取第一份，建立节点数与预分配矩阵
+    # 第一遍：计算均值和基本信息（避免一次性加载所有数据）
+    print("第一遍：计算快照均值和统计信息...")
     x0, y0, z0, T0, regions0, cols0 = _read_snapshot(files[0])
     N = T0.shape[0]
     M = len(files)
     dtype_np = np.float32 if dtype == "float32" else np.float64
-    Tmat = np.empty((N, M), dtype=dtype_np)
+
+    # 使用增量方式计算均值
+    T_sum = np.zeros(N, dtype=dtype_np)
     names = []
     cols_used = []
-    # 填充第一列
-    Tmat[:, 0] = T0.astype(dtype_np)
-    names.append(os.path.relpath(files[0], snapshot_dir))
-    cols_used.append((os.path.basename(files[0]), cols0))
 
-    for j, f in enumerate(files[1:], start=1):
+    for j, f in enumerate(files):
         _, _, _, T, regions, cols = _read_snapshot(f)
         if T.shape[0] != N:
             raise ValueError(f"节点数不一致: {os.path.basename(files[0])}={N}, {os.path.basename(f)}={T.shape[0]}")
-        Tmat[:, j] = T.astype(dtype_np)
+
+        T_sum += T.astype(dtype_np)
         names.append(os.path.relpath(f, snapshot_dir))
         cols_used.append((os.path.basename(f), cols))
         if progress_every and (j % progress_every == 0):
-            print(f"  已读取 {j+1}/{M} …")
+            print(f"  已处理 {j+1}/{M} 计算均值...")
 
-    # 组装温度矩阵 [N, M]
-    Tbar = np.mean(Tmat, axis=1, keepdims=True)  # [N,1]
-    A = Tmat - Tbar                           # 去均值
+    Tbar_vec = T_sum / M  # [N]
+    Tbar = Tbar_vec.reshape(-1, 1)  # [N,1]
+
+    # 第二遍：计算POD基（分批处理避免内存溢出）
+    print("第二遍：计算POD基（分批处理大规模数据）...")
 
     # 自动估计 r（基于能量保持率）
     if r is None:
-        # 策略：先估计总能量，再决定需要多少模态
+        # 使用采样方法估计能量分布（避免一次性处理所有数据）
         n_est = min(M, 200)  # 增加到200以更准确估计
         try:
-            print(f"  正在估计能量分布（前 {n_est} 个模态）...")
-            _, S_est, _ = randomized_svd(A, n_components=n_est, random_state=42)
+            # 采样计算能量估计
+            sample_indices = np.random.choice(M, size=min(M, 1000), replace=False)
+            sample_snapshots = []
+
+            for idx in sample_indices:
+                f = files[idx]
+                _, _, _, T, _, _ = _read_snapshot(f)
+                A_sample = (T.astype(dtype_np) - Tbar_vec).reshape(-1, 1)
+                sample_snapshots.append(A_sample)
+
+            # 合并采样数据用于能量估计
+            A_sample = np.concatenate(sample_snapshots, axis=1)  # [N, sample_size]
+
+            print(f"  正在估计能量分布（基于 {len(sample_indices)} 个采样快照）...")
+            _, S_est, _ = randomized_svd(A_sample, n_components=min(n_est, len(sample_indices)), random_state=42)
             energy_est = S_est ** 2
-            
+
             # 估算总能量：用 Frobenius 范数
-            total_energy_est = np.linalg.norm(A, 'fro') ** 2
+            total_energy_est = np.linalg.norm(A_sample, 'fro') ** 2
             cum_energy = np.cumsum(energy_est)
             cum_ratio = cum_energy / total_energy_est
-            
+
             # 找到第一个超过 energy_keep 的位置
             r = int(np.searchsorted(cum_ratio, energy_keep) + 1)
             r = max(5, min(r, n_est))  # 至少5个模态，避免r=1
-            
+
             actual_ratio = cum_ratio[r-1] if r <= len(cum_ratio) else cum_ratio[-1]
             print(f"  估计需要 r={r} 个模态以保持 {actual_ratio*100:.2f}% 能量（目标 {energy_keep*100:.1f}%）")
         except Exception as e:
             print(f"  自动估计 r 失败：{e}，使用 r=min(50, M)")
             r = min(50, M)
-    
-    # 使用 Randomized SVD（内存友好，速度快）
-    print(f"  执行 Randomized SVD (r={r})...")
-    U, S, Vt = randomized_svd(A, n_components=r, n_iter=5, random_state=42)  # U:[N,r], S:[r], Vt:[r,M]
 
-    Phi = U.copy()                 # [N,r]（randomized_svd 已经返回 r 列）
-    Tbar_vec = Tbar[:, 0].copy()   # [N]
+    # 使用采样Randomized SVD（避免内存溢出，同时获得更好的POD基）
+    print(f"  执行采样 Randomized SVD (r={r})...")
 
+    # 随机采样快照用于构建POD基（采样率约10-20%）
+    sample_ratio = min(0.15, 1000 / M)  # 最多采样1000个快照
+    sample_size = max(500, int(M * sample_ratio))
+    sample_size = min(sample_size, M)
+
+    print(f"  采样 {sample_size}/{M} 个快照构建POD基...")
+
+    # 随机选择采样索引
+    sample_indices = np.random.choice(M, size=sample_size, replace=False)
+    sample_indices.sort()  # 排序便于处理
+
+    # 读取采样快照
+    sample_snapshots = []
+    for idx in sample_indices:
+        f = files[idx]
+        _, _, _, T, _, _ = _read_snapshot(f)
+        # 去均值并转换为列向量
+        A_col = (T.astype(dtype_np) - Tbar_vec).reshape(-1, 1)
+        sample_snapshots.append(A_col)
+
+    # 合并采样数据
+    A_sample = np.concatenate(sample_snapshots, axis=1)  # [N, sample_size]
+
+    # 对采样数据计算Randomized SVD获得POD基
+    print(f"  计算采样数据的Randomized SVD...")
+    U_sample, S_sample, Vt_sample = randomized_svd(
+        A_sample, n_components=r, n_iter=5, random_state=42
+    )
+
+    Phi = U_sample.copy()  # [N, r]
+    S_full = S_sample.copy()
+
+    # 现在计算所有快照的POD系数（分批处理）
+    batch_size = min(1000, M)  # 每批处理1000个快照（增大批次减少批次数）
+    all_coeffs = []
+
+    for i in range(0, M, batch_size):
+        end_idx = min(i + batch_size, M)
+        print(f"  计算系数批次 {i//batch_size + 1}/{(M + batch_size - 1)//batch_size} ({end_idx - i} 个快照)...")
+
+        # 读取当前批次的数据
+        batch_snapshots = []
+        for j in range(i, end_idx):
+            f = files[j]
+            _, _, _, T, _, _ = _read_snapshot(f)
+            # 去均值并转换为列向量
+            A_col = (T.astype(dtype_np) - Tbar_vec).reshape(-1, 1)
+            batch_snapshots.append(A_col)
+
+        # 合并批次数据
+        A_batch = np.concatenate(batch_snapshots, axis=1)  # [N, batch_size]
+
+        # 投影到POD基获得系数：coeffs = Phi^T @ A_batch
+        coeffs_batch = Phi.T @ A_batch  # [r, N] @ [N, batch_size] = [r, batch_size]
+        coeffs_batch = coeffs_batch.T  # [batch_size, r]
+        all_coeffs.append(coeffs_batch)
+
+    # 合并所有批次的系数
+    coeffs = np.concatenate(all_coeffs, axis=0)  # [M, r]
+
+    # 保存POD结果
     os.makedirs(save_dir, exist_ok=True)
-    np.save(os.path.join(save_dir, "pod_phi.npy"),  Phi)
+    np.save(os.path.join(save_dir, "pod_phi.npy"), Phi)
     np.save(os.path.join(save_dir, "pod_mean.npy"), Tbar_vec)
-
-    # 额外保存：每帧的 POD 系数（按 summary 文件顺序）
-    # A = U S V^T  →  a = S_r V_r^T （每列一个帧）
-    coeffs = (S[:, None] * Vt).T     # [M, r]
     np.save(os.path.join(save_dir, "pod_coeffs.npy"), coeffs.astype(dtype_np, copy=False))
 
     # 额外保存：坐标（来自第一帧），方便物理残差使用
@@ -338,7 +406,7 @@ def build_pod_from_folder(
     np.save(os.path.join(save_dir, "pod_coords.npy"), coords)
 
     # 保存摘要（含：能量、每个文件识别到的列名）
-    energy = (S**2)
+    energy = (S_full**2)
     cum = np.cumsum(energy) / (np.sum(energy) + 1e-12)
     keep = cum[r-1] if r-1 < len(cum) else 1.0
     summary = pd.DataFrame({"file": names})

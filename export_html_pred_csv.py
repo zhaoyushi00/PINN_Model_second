@@ -1,16 +1,17 @@
 import os
 import argparse
+from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
 import pyvista as pv  # 仅用于读取 STL 并提取三角面
 
-DEFAULT_DIR = "predict_visualization_results/11000_csv"
+DEFAULT_DIR = "prediction_results/12000_csv"
 DEFAULT_STL = "data/model.stl"
-DEFAULT_OUT = "predict_visualization_results/sequence_viewer_2.html"
-DEFAULT_POINT_STRIDE = 5     # 点抽样（每N个点取1个）
-DEFAULT_FRAME_STRIDE = 1    # 帧抽样（每N帧取1帧）
+DEFAULT_OUT = "predict_visualization_results/sequence_viewer_12000.html"
+DEFAULT_POINT_STRIDE = 6     # 点抽样（每N个点取1个）
+DEFAULT_FRAME_STRIDE = 3    # 帧抽样（每N帧取1帧）
 DEFAULT_MAX_FRAMES = None     # 限制最大帧数，避免HTML过大
 DEFAULT_FPS = 10             # 播放帧率（帧/秒）
 
@@ -131,7 +132,7 @@ def build_html(seq_dir: str, stl_path: str, out_html: str,
             color='lightgray', opacity=0.2, name='surface', showscale=False
         ))
 
-    # 初始散点
+    # 初始散点（增加 hover 提示：坐标与温度值）
     fig.add_trace(go.Scatter3d(
         x=x[idx_keep], y=y[idx_keep], z=z[idx_keep],
         mode='markers',
@@ -141,6 +142,15 @@ def build_html(seq_dir: str, stl_path: str, out_html: str,
             colorscale='Plasma',
             cmin=vmin, cmax=vmax,
             colorbar=dict(title='Temperature (°C)')
+        ),
+        # 将温度作为 customdata 以便 hover 展示，并在帧动画中同步更新
+        customdata=t0[idx_keep].reshape(-1, 1),
+        hovertemplate=(
+            'x = %{x:.6f} m<br>' +
+            'y = %{y:.6f} m<br>' +
+            'z = %{z:.6f} m<br>' +
+            'T = %{customdata[0]:.3f} °C' +
+            '<extra></extra>'
         ),
         name='temperature'
     ))
@@ -156,8 +166,12 @@ def build_html(seq_dir: str, stl_path: str, out_html: str,
         df = _read_csv(fpath)
         vals = pd.to_numeric(df[tcol], errors='coerce').to_numpy(np.float32)[idx_keep]
         tsec = sec_map.get(fname, ti)
+        # 在每一帧中同时更新颜色与 customdata，使 hover 的温度值与当前帧一致
         frames.append(go.Frame(
-            data=[go.Scatter3d(marker=dict(color=vals, colorscale='Plasma', cmin=vmin, cmax=vmax))],
+            data=[go.Scatter3d(
+                marker=dict(color=vals, colorscale='Plasma', cmin=vmin, cmax=vmax),
+                customdata=vals.reshape(-1, 1)
+            )],
             traces=[scatter_idx],
             name=str(tsec)
         ))
@@ -211,6 +225,12 @@ def main():
     ap.add_argument('--max-frames', type=int, default=DEFAULT_MAX_FRAMES)
     ap.add_argument('--fps', type=int, default=DEFAULT_FPS)
     args = ap.parse_args()
+
+    print("可视化配置：")
+    print(f"  dir={args.dir}")
+    print(f"  out={args.out}")
+    print(f"  stl={args.stl}")
+    print(f"  point_stride={args.point_stride}, frame_stride={args.frame_stride}, max_frames={args.max_frames}, fps={args.fps}")
 
     build_html(seq_dir=args.dir, stl_path=args.stl, out_html=args.out,
                point_stride=args.point_stride, frame_stride=args.frame_stride,

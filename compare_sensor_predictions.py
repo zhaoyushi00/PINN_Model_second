@@ -17,10 +17,10 @@ rcParams['axes.unicode_minus'] = False
 
 @dataclass
 class CompareConfig:
-    rpm: int = 9000
+    rpm: int = 12000  # 可改为 9000/12000/15000/18000/21000
     sensors_map_csv: str = "data/sensors_map.csv"
-    real_data_csv: str = "data/real_steady/9000.csv"
-    pred_csv_dir: str = "predict_visualization_results/9000_csv"
+    real_data_csv: str = ""  # 留空将根据 rpm 自动设置为 data/real_steady/{rpm}.csv
+    pred_csv_dir: str = ""   # 留空将根据 rpm 自动设置为 prediction_results/{rpm}_csv
     output_dir: str = "sensor_comparison_results"
     time_samples: int = 10  # 采样多少个时间点进行对比
 
@@ -70,28 +70,41 @@ def extract_predicted_temps(pred_csv_dir: str, sensor_node_indices: np.ndarray,
         times: [T] 时间索引数组
         temps: [T, N_sensors] 温度数组
     """
-    # 读取meta文件获取所有时间点
-    meta = read_csv_auto_encoding(os.path.join(pred_csv_dir, "meta_pred.csv"))
+    # 扫描目录中的所有 temp_*.csv 文件
+    import glob
+    csv_files = sorted(glob.glob(os.path.join(pred_csv_dir, "temp_*.csv")))
+
+    if not csv_files:
+        raise FileNotFoundError(f"在 {pred_csv_dir} 中找不到 temp_*.csv 文件")
+
+    # 从文件名中提取时间索引
+    all_times = []
+    for f in csv_files:
+        # 从 temp_0000.csv 提取时间
+        basename = os.path.basename(f)
+        time_idx = int(basename.split('_')[1].split('.')[0])
+        all_times.append(time_idx)
+    
+    all_times = np.array(all_times)
     
     # 采样时间点
-    total_times = len(meta)
+    total_times = len(all_times)
     if time_samples >= total_times:
         time_indices = np.arange(total_times)
     else:
         time_indices = np.linspace(0, total_times - 1, time_samples, dtype=int)
     
-    times = meta.iloc[time_indices]["time_seconds"].values
-    files = meta.iloc[time_indices]["file"].values
+    times = all_times[time_indices]
+    selected_files = [csv_files[i] for i in time_indices]
     
     # 提取每个时间点的温度
     temps_list = []
-    for i, (t, f) in enumerate(zip(times, files)):
-        csv_path = os.path.join(pred_csv_dir, f)
+    for i, (t, csv_path) in enumerate(zip(times, selected_files)):
         df = read_csv_auto_encoding(csv_path)
         
-        # 提取温度列
+        # 提取温度列（新格式使用 'T'）
         temp_col = None
-        for col in ["Temperature (°C)", "Temperature", "temperature"]:
+        for col in ["T", "Temperature (°C)", "Temperature", "temperature"]:
             if col in df.columns:
                 temp_col = col
                 break
@@ -273,6 +286,12 @@ def calculate_metrics(pred_temps: np.ndarray, real_temps: np.ndarray,
 
 def main():
     cfg = CompareConfig()
+
+    # 自动补全路径
+    if not cfg.pred_csv_dir:
+        cfg.pred_csv_dir = os.path.join("prediction_results", f"{cfg.rpm}_csv")
+    if not cfg.real_data_csv:
+        cfg.real_data_csv = os.path.join("data", "real_steady", f"{cfg.rpm}.csv")
     
     print("=" * 70)
     print(f"传感器位置温度对比验证 - {cfg.rpm} RPM")
@@ -289,9 +308,24 @@ def main():
     
     # 2. 读取一个预测文件，获取网格坐标
     print("\n[2] 匹配传感器到网格节点...")
-    sample_csv = os.path.join(cfg.pred_csv_dir, "temp_3600.csv")
+    import glob
+    csv_files = sorted(glob.glob(os.path.join(cfg.pred_csv_dir, "temp_*.csv")))
+    if not csv_files:
+        raise FileNotFoundError(f"在 {cfg.pred_csv_dir} 中找不到 temp_*.csv 文件。\n"
+                                f"请先运行导出脚本或检查路径是否为 prediction_results/{cfg.rpm}_csv")
+    sample_csv = csv_files[0]  # 使用第一个文件
     mesh_df = read_csv_auto_encoding(sample_csv)
-    mesh_coords = mesh_df[['X Location (m)', 'Y Location (m)', 'Z Location (m)']].values
+    
+    # 自动识别坐标列名
+    coord_cols = None
+    if 'x' in mesh_df.columns and 'y' in mesh_df.columns and 'z' in mesh_df.columns:
+        coord_cols = ['x', 'y', 'z']
+    elif 'X Location (m)' in mesh_df.columns:
+        coord_cols = ['X Location (m)', 'Y Location (m)', 'Z Location (m)']
+    else:
+        raise ValueError(f"找不到坐标列，可用列: {mesh_df.columns.tolist()}")
+    
+    mesh_coords = mesh_df[coord_cols].values
     
     # 找到最近的节点
     sensor_node_indices = find_nearest_nodes(sensor_coords, mesh_coords)

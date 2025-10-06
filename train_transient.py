@@ -73,8 +73,26 @@ def compute_physics_residual(
 def r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     y_true = y_true.reshape(-1)
     y_pred = y_pred.reshape(-1)
-    sst = np.sum((y_true - y_true.mean()) ** 2)
-    sse = np.sum((y_true - y_pred) ** 2)
+
+    # 增量计算R2分数，避免一次性计算大数组的均值
+    if len(y_true) == 0:
+        return 0.0
+
+    # 计算均值的增量公式
+    n = len(y_true)
+    y_true_sum = np.sum(y_true)
+    y_pred_sum = np.sum(y_pred)
+    y_true_sq_sum = np.sum(y_true ** 2)
+    y_pred_sq_sum = np.sum(y_pred ** 2)
+    cross_sum = np.sum(y_true * y_pred)
+
+    # SST (总平方和)
+    y_true_mean = y_true_sum / n
+    sst = y_true_sq_sum - n * (y_true_mean ** 2)
+
+    # SSE (残差平方和)
+    sse = y_true_sq_sum + y_pred_sq_sum - 2 * cross_sum
+
     return float(1.0 - (sse / (sst + 1e-12)))
 
 
@@ -139,11 +157,16 @@ def _prepare_loaders(cfg: TrainConfig, dataset: SnapshotSequenceDataset):
 def _eval_on_val(model, val_loader, Phi, Tbar, coords, cfg: TrainConfig):
     model.eval()
     l2 = nn.MSELoss(reduction="mean")
-    coeff_mse = []
-    T_true_all = []
-    T_pred_all = []
+    # 增量计算指标，避免内存溢出
+    T_true_sum = 0.0
+    T_pred_sum = 0.0
+    T_true_sq_sum = 0.0
+    T_pred_sq_sum = 0.0
+    cross_sum = 0.0
+    T_count = 0
     sensor_mae_list = []
     phys_res_list = []
+    coeff_mse = []
 
     with torch.no_grad():
         for batch in val_loader:
@@ -160,8 +183,20 @@ def _eval_on_val(model, val_loader, Phi, Tbar, coords, cfg: TrainConfig):
             y_true = target[:, -1]  # [B, r]
             T_pred = (Tbar + a_last @ Phi.t()).detach().cpu().numpy()  # [B, N]
             T_true = (Tbar + y_true @ Phi.t()).detach().cpu().numpy()
-            T_true_all.append(T_true)
-            T_pred_all.append(T_pred)
+
+            # 增量计算R2分数所需统计量
+            B, N = T_true.shape
+            batch_count = B * N
+
+            T_true_flat = T_true.reshape(-1)
+            T_pred_flat = T_pred.reshape(-1)
+
+            T_true_sum += np.sum(T_true_flat)
+            T_pred_sum += np.sum(T_pred_flat)
+            T_true_sq_sum += np.sum(T_true_flat ** 2)
+            T_pred_sq_sum += np.sum(T_pred_flat ** 2)
+            cross_sum += np.sum(T_true_flat * T_pred_flat)
+            T_count += batch_count
 
             # 传感器 MAE（如有，对horizon所有步求平均）
             if "sensor_target" in batch and coords is not None:
@@ -205,13 +240,30 @@ def _eval_on_val(model, val_loader, Phi, Tbar, coords, cfg: TrainConfig):
                 phys_res_list.append(float(phys.detach().cpu()))
 
     coeff_mse_val = float(np.mean(coeff_mse)) if coeff_mse else 0.0
-    T_true_all = np.concatenate(T_true_all, axis=0) if T_true_all else np.zeros((1, 1))
-    T_pred_all = np.concatenate(T_pred_all, axis=0) if T_pred_all else np.zeros((1, 1))
+
+    # 使用增量统计量计算R2分数和MAE
+    if T_count > 0:
+        # 计算R2分数
+        y_true_mean = T_true_sum / T_count
+        sst = T_true_sq_sum - T_count * (y_true_mean ** 2)
+        sse = T_true_sq_sum + T_pred_sq_sum - 2 * cross_sum
+        T_r2 = 1.0 - (sse / (sst + 1e-12))
+
+        # 计算MAE
+        T_mae = abs(T_true_sum - T_pred_sum) / T_count
+
+        # 计算RMSE
+        T_rmse = np.sqrt(abs(sse) / T_count)
+    else:
+        T_r2 = 0.0
+        T_mae = 0.0
+        T_rmse = 0.0
+
     return {
         "coeff_mse": coeff_mse_val,
-        "T_r2": r2_score(T_true_all, T_pred_all),
-        "T_mae": mae(T_true_all, T_pred_all),
-        "T_rmse": rmse(T_true_all, T_pred_all),
+        "T_r2": float(T_r2),
+        "T_mae": float(T_mae),
+        "T_rmse": float(T_rmse),
         "sensor_mae": (float(np.mean(sensor_mae_list)) if sensor_mae_list else None),
         "phys_res": (float(np.mean(phys_res_list)) if phys_res_list else None),
     }
